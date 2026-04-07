@@ -3,6 +3,7 @@
 #include <DHT.h>
 #include <DHT_U.h>
 #include <PMS.h>
+#include "secrets.h"
 
 #define DHTPIN 4
 #define DHTTYPE DHT22
@@ -13,8 +14,8 @@ PMS pms(Serial2);
 PMS::DATA data;
 
 // ---- WiFi ----
-const char* ssid = "YOUR_WIFI_NAME";
-const char* password = "YOUR_WIFI_PASSWORD";
+const char* ssid = WIFI_SSID;
+const char* password = WIFI_PASSWORD;
 
 WiFiServer server(80);
 
