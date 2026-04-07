@@ -13,12 +13,16 @@
  * How it works:
  *   1. On boot, the ESP32 connects to your WiFi network and starts
  *      a tiny web server on port 80 (normal HTTP).
- *   2. Every 100ms, the main loop reads both sensors and checks if
- *      anyone is trying to view the web page.
+ *   2. The main loop checks sensors and handles web requests.
+ *      - The DHT22 is read every 2 seconds (its internal refresh rate).
+ *      - The PMS5003 runs a duty cycle: it wakes up, runs for 30 seconds
+ *        to get stable readings, then sleeps for a configurable period
+ *        to save power (~100 mA). By default it sleeps for 90 seconds,
+ *        giving a 2-minute measurement cycle.
  *   3. When you visit the ESP32's IP address in a browser, it builds
  *      an HTML page with the latest readings and sends it back.
- *   4. The page auto-refreshes every 5 seconds so you always see
- *      current data.
+ *   4. The page auto-refreshes every 30 seconds so you always see
+ *      reasonably current data without excessive network traffic.
  */
 
 // --- Libraries ---
@@ -64,6 +68,23 @@ WiFiServer server(80);
 // How long to wait for WiFi before giving up (milliseconds).
 #define WIFI_TIMEOUT_MS 30000    // 30 seconds on initial connect
 #define WIFI_RECONNECT_MS 10000  // Check connection every 10 seconds
+
+// --- PMS5003 Duty Cycle Configuration ---
+// The PMS5003's fan and laser draw ~100 mA. Running them continuously
+// wastes power and shortens the fan's lifespan. Instead, we wake the
+// sensor periodically, let it stabilize, take a reading, then put it
+// back to sleep. The datasheet recommends at least 30 seconds of
+// run time before trusting the readings.
+//
+// With the defaults below the sensor is awake for 30 s out of every
+// 120 s (25% duty cycle), cutting its average draw from ~100 mA to ~25 mA.
+#define PMS_WAKE_MS   30000   // Run the fan/laser for 30 seconds
+#define PMS_SLEEP_MS  90000   // Then sleep for 90 seconds
+
+// --- DHT22 Read Interval ---
+// The DHT22's internal sampling rate is once every 2 seconds.
+// Reading it faster just returns the same value and wastes CPU time.
+#define DHT_READ_MS 2000
 
 /*
  * connectWiFi() - Attempt to join the WiFi network.
@@ -140,33 +161,81 @@ float lastHumidity = NAN;
 bool pmsReady = false;    // Has the PMS5003 delivered at least one reading?
 PMS::DATA lastPms;        // Last successful particulate reading
 
+// --- PMS5003 duty-cycle state machine ---
+// The sensor alternates between two states:
+//   AWAKE  – fan spinning, laser on, actively sending data frames
+//   ASLEEP – fan and laser off, drawing almost no current
+// We track the state and when we entered it so we know when to switch.
+bool pmsAwake = true;                // Starts awake after power-on
+unsigned long pmsStateStart = 0;     // millis() when we entered the current state
+
+// --- DHT22 read throttle ---
+// Tracks the last time we polled the DHT22 so we only read it every
+// DHT_READ_MS milliseconds instead of every loop iteration.
+unsigned long lastDhtRead = 0;
+
 /*
  * readSensors() - Poll both sensors and update the cache.
  *
- * DHT22: Returns NAN on failure (wiring issue, sensor busy, etc.).
+ * DHT22: Only polled every DHT_READ_MS (2 seconds) to match the sensor's
+ *        internal refresh rate. Returns NAN on failure (wiring issue, etc.).
  *        We only update the cache when BOTH temp and humidity are valid.
  *
- * PMS5003: pms.read() is non-blocking -- it returns true only when a
- *          complete new data frame has arrived over serial. The sensor
- *          sends a new frame roughly every 1 second. Between frames,
- *          read() returns false and we just keep the previous values.
+ * PMS5003: Runs a duty cycle to save power:
+ *   1. AWAKE  – fan and laser are on. We call pms.read() to grab data.
+ *              After PMS_WAKE_MS (30 s) we put the sensor to sleep.
+ *   2. ASLEEP – fan and laser are off (~0 mA). After PMS_SLEEP_MS (90 s)
+ *              we wake it up and go back to step 1.
+ *
+ *   The first cycle after boot skips the initial sleep so you get a
+ *   reading within 30 seconds of power-on.
  */
 void readSensors() {
-  float h = dht.readHumidity();     // Relative humidity in %
-  float t = dht.readTemperature();  // Temperature in Celsius
+  // ---- DHT22 (throttled) ----
+  // Only read once every DHT_READ_MS. millis() wraps after ~50 days,
+  // but unsigned subtraction handles that correctly.
+  if (millis() - lastDhtRead >= DHT_READ_MS) {
+    lastDhtRead = millis();
 
-  // isnan() checks if a float is "Not A Number" (i.e., the read failed).
-  // We only update the cache when both values are valid so we never
-  // display a mix of one good reading and one "nan".
-  if (!isnan(t) && !isnan(h)) {
-    lastTemp = t;
-    lastHumidity = h;
+    float h = dht.readHumidity();     // Relative humidity in %
+    float t = dht.readTemperature();  // Temperature in Celsius
+
+    // isnan() checks if a float is "Not A Number" (i.e., the read failed).
+    // We only update the cache when both values are valid so we never
+    // display a mix of one good reading and one "nan".
+    if (!isnan(t) && !isnan(h)) {
+      lastTemp = t;
+      lastHumidity = h;
+    }
   }
 
-  // Check if the PMS5003 has sent a new data frame.
-  if (pms.read(data)) {
-    lastPms = data;
-    pmsReady = true;
+  // ---- PMS5003 (duty-cycled) ----
+  unsigned long elapsed = millis() - pmsStateStart;
+
+  if (pmsAwake) {
+    // The sensor is running -- try to read a data frame.
+    // pms.read() is non-blocking: it returns true only when a complete
+    // 32-byte frame has arrived over serial (~once per second).
+    if (pms.read(data)) {
+      lastPms = data;
+      pmsReady = true;
+    }
+
+    // After PMS_WAKE_MS of run time, put the sensor to sleep.
+    if (elapsed >= PMS_WAKE_MS) {
+      pms.sleep();   // Sends a command over serial to turn off the fan/laser
+      pmsAwake = false;
+      pmsStateStart = millis();
+      Serial.println("PMS5003 sleeping");
+    }
+  } else {
+    // The sensor is asleep -- check if it's time to wake up.
+    if (elapsed >= PMS_SLEEP_MS) {
+      pms.wakeUp();  // Sends a command over serial to turn on the fan/laser
+      pmsAwake = true;
+      pmsStateStart = millis();
+      Serial.println("PMS5003 waking up");
+    }
   }
 }
 
@@ -187,7 +256,7 @@ static char pageBuf[1024];
  * The page includes:
  *   - Temperature and humidity (or an error message if sensor failed)
  *   - PM1.0, PM2.5, and PM10 readings (or "warming up" if no data yet)
- *   - Auto-refresh every 5 seconds via <meta http-equiv='refresh'>
+ *   - Auto-refresh every 30 seconds via <meta http-equiv='refresh'>
  */
 const char* htmlPage() {
   // Build each section into small temporary buffers first, then combine
@@ -228,10 +297,11 @@ const char* htmlPage() {
 
   // Assemble the full HTML page.
   // The <meta refresh> tag tells the browser to reload the page every
-  // 5 seconds, so the readings update automatically without JavaScript.
+  // 30 seconds. This is a good balance: the data stays reasonably
+  // current without flooding the ESP32 with HTTP requests.
   snprintf(pageBuf, sizeof(pageBuf),
     "<!DOCTYPE html><html><head>"
-    "<meta http-equiv='refresh' content='5'>"
+    "<meta http-equiv='refresh' content='30'>"
     "<style>body{font-family:Arial;margin:40px;}h1{color:#333;}.error{color:#c00;}</style>"
     "</head><body>"
     "<h1>ESP32 Air Quality Station</h1>"

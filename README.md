@@ -4,7 +4,7 @@ An air quality monitoring station built with an ESP32, a DHT22 temperature/humid
 
 ## What It Does
 
-The ESP32 reads sensor data and hosts a tiny web page that auto-refreshes every 5 seconds. Open the page on your phone, tablet, or computer to see:
+The ESP32 reads sensor data and hosts a tiny web page that auto-refreshes every 30 seconds. Open the page on your phone, tablet, or computer to see:
 
 - **Temperature** (Celsius)
 - **Humidity** (%)
@@ -202,7 +202,7 @@ By default, the ESP32 gets a dynamic IP address from your router via DHCP. This 
 1. Make sure your phone/computer is on the **same WiFi network** as the ESP32.
 2. Open any web browser.
 3. Type the ESP32's IP address in the address bar (e.g., `http://192.168.1.42`).
-4. The dashboard loads and auto-refreshes every 5 seconds.
+4. The dashboard loads and auto-refreshes every 30 seconds.
 
 ### What You'll See
 
@@ -283,8 +283,69 @@ airqualitymonitor/
 
 ### Page loads but shows stale data
 
-- The page auto-refreshes every 5 seconds. If values seem frozen, the sensors may be disconnected. Check the Serial Monitor for error messages.
+- The page auto-refreshes every 30 seconds. If values seem frozen, the sensors may be disconnected. Check the Serial Monitor for error messages.
 - Try power-cycling the ESP32 (unplug and replug USB).
+
+## Power Consumption
+
+### Component Breakdown
+
+| Component | Active | Sleep/Idle | Notes |
+|-----------|--------|------------|-------|
+| **ESP32 (WiFi active)** | ~160--240 mA | ~10 mA (deep sleep) | WiFi is always on in this project |
+| **DHT22** | ~1.5 mA (during read) | ~50 uA (idle) | Reads once every 2 seconds |
+| **PMS5003** | ~100 mA | ~2 mA (sleep mode) | Fan + laser are the big draw |
+| **Total (PMS awake)** | ~260--340 mA | | |
+| **Total (PMS sleeping)** | ~160--240 mA | | |
+
+### Duty Cycle Optimization
+
+The PMS5003's fan and laser are the biggest power consumers after the ESP32 itself. Running them 24/7 wastes power and wears out the fan faster. The code implements a duty cycle:
+
+1. **Wake** the PMS5003 -- fan spins up, laser turns on
+2. **Wait 30 seconds** for the airflow to stabilize (datasheet recommendation)
+3. **Read** the PM values
+4. **Sleep** the PMS5003 for 90 seconds -- fan and laser turn off
+
+This gives a 2-minute measurement cycle with the sensor active only 25% of the time. The average PMS5003 draw drops from ~100 mA to ~25 mA.
+
+### Estimated Average Draw
+
+With the default duty cycle (30 s wake / 90 s sleep):
+
+```
+ESP32 (WiFi on):     ~200 mA  (always on)
+DHT22:                 ~1 mA  (negligible)
+PMS5003 (25% duty):  ~25 mA  (averaged over the cycle)
+                     --------
+Total:               ~226 mA average
+```
+
+### Run Time Estimates
+
+| Power Source | Capacity | Estimated Run Time |
+|--------------|----------|-------------------|
+| USB port (500 mA) | Continuous | Indefinite (wall-powered) |
+| 10,000 mAh power bank | 10,000 mAh | ~40--44 hours |
+| 5,000 mAh power bank | 5,000 mAh | ~20--22 hours |
+| 18650 Li-ion cell (1S) | ~3,000 mAh | ~13 hours (needs 3.3V regulator) |
+
+> **Note:** These are rough estimates. Real-world run time depends on WiFi signal strength (weaker signal = more TX power), how often browsers request the page, and power bank efficiency (typically 85--90% for the DC-DC converter).
+
+### Tuning the Duty Cycle
+
+You can adjust the duty cycle constants in `main.cpp` to trade freshness for power:
+
+| Setting | Default | Effect of Increasing |
+|---------|---------|---------------------|
+| `PMS_WAKE_MS` | 30000 (30 s) | Longer warm-up = more stable first reading, but more power |
+| `PMS_SLEEP_MS` | 90000 (90 s) | Longer sleep = less power, but staler PM data |
+
+**Examples:**
+
+- **Maximum freshness:** `PMS_WAKE_MS = 30000`, `PMS_SLEEP_MS = 30000` (50% duty, ~1 min cycle)
+- **Maximum power savings:** `PMS_WAKE_MS = 30000`, `PMS_SLEEP_MS = 270000` (10% duty, ~5 min cycle)
+- **Default balance:** `PMS_WAKE_MS = 30000`, `PMS_SLEEP_MS = 90000` (25% duty, ~2 min cycle)
 
 ## Future Ideas
 
