@@ -394,6 +394,12 @@ void readSensors() {
 // Small reusable buffer for formatting individual lines of output.
 // This is much more memory-efficient than building the whole page
 // in one giant buffer.
+//
+// IMPORTANT: Every sendChunk() call must produce output shorter than
+// this buffer. If a formatted string exceeds this size, vsnprintf
+// silently truncates it and the HTML will be broken. When adding
+// new sendChunk() calls, keep each one well under this limit --
+// split large chunks into multiple calls if needed.
 static char lineBuf[256];
 
 /*
@@ -474,7 +480,7 @@ void sendDashboardPage(WiFiClient& client) {
       ".info{color:#888;font-size:0.85em;margin-top:5px;}"
     "</style>"
     "</head><body>"
-    "<h1>ESP32 Air Quality Station</h1>"
+    "<h1>ESP32 Air Quality Monitor</h1>"
   );
 
   // ---- Current readings cards ----
@@ -505,13 +511,17 @@ void sendDashboardPage(WiFiClient& client) {
                             lastPms.PM_AE_UG_2_5 <= 35 ? "card warn" : "card error";
       sendChunk(client,
         "<div class='card'><div class='label'>PM1.0</div>"
-        "<div class='value'>%u &micro;g/m&sup3;</div></div>"
+        "<div class='value'>%u &micro;g/m&sup3;</div></div>",
+        lastPms.PM_AE_UG_1_0);
+      sendChunk(client,
         "<div class='%s'><div class='label'>PM2.5</div>"
-        "<div class='value'>%u &micro;g/m&sup3;</div></div>"
+        "<div class='value'>%u &micro;g/m&sup3;</div></div>",
+        pmClass, lastPms.PM_AE_UG_2_5);
+      sendChunk(client,
         "<div class='card'><div class='label'>PM10</div>"
-        "<div class='value'>%u &micro;g/m&sup3;</div></div></div>",
-        lastPms.PM_AE_UG_1_0, pmClass,
-        lastPms.PM_AE_UG_2_5, lastPms.PM_AE_UG_10_0);
+        "<div class='value'>%u &micro;g/m&sup3;</div></div>"
+        "</div>",
+        lastPms.PM_AE_UG_10_0);
     }
   }
 

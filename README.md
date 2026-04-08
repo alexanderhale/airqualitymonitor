@@ -39,8 +39,7 @@ PM2.5 is the number most commonly reported in air quality forecasts. Levels belo
 
 **Optional but helpful:**
 - 10K-ohm resistor (pull-up for the DHT22 data line -- many DHT22 breakout boards have this built in)
-- PMS5003 breakout/adapter board (the raw sensor has a 1.27mm pitch connector that's hard to breadboard directly).
-   - Alternatively, you can cut the connector off one end and insert each strand of the wire individually into the breadboard.
+- PMS5003 breakout/adapter board (the raw sensor has a 1.27mm pitch connector that's hard to breadboard directly). Alternatively, you can cut the connector off one end of the ribbon cable and insert each wire individually into the breadboard -- see the [wiring section](#pms5003-to-esp32) for the pin order.
 
 ### Software
 
@@ -76,21 +75,45 @@ DATA ----+--------> GPIO 4
 
 ### PMS5003 to ESP32
 
-The PMS5003 uses a serial (UART) connection. It has an 8-pin connector, but you only need 4 wires:
+The PMS5003 uses a serial (UART) connection. It comes with an 8-pin ribbon cable (1.27mm pitch connector on each end). Unlike the DHT22, the pins are **not labeled on the sensor or the connector** -- you need to identify them by position.
+
+#### PMS5003 cable pinout
+
+The connector has 8 wires. Looking at the sensor with the fan facing you and the connector on the right side, pin 1 is the **top** pin. The full pinout:
+
+| Pin | Signal | Description | Connect to ESP32? |
+|-----|--------|-------------|-------------------|
+| 1 | VCC | 5V power input | **Yes** -- ESP32 VIN (5V) |
+| 2 | GND | Ground | **Yes** -- ESP32 GND |
+| 3 | SET | Sleep mode control (high = active) | No -- leave unconnected |
+| 4 | RX | Serial receive (3.3V TTL) | No -- not needed for this project |
+| 5 | TX | Serial transmit (3.3V TTL) | **Yes** -- ESP32 GPIO 16 (RX2) |
+| 6 | RESET | Hardware reset (active low) | No -- leave unconnected |
+| 7 | NC | Not connected | No |
+| 8 | NC | Not connected | No |
+
+> **Wire colors:** Some PMS5003 cables use purple (pin 1/VCC), orange (pin 2/GND), white (SET), blue (RX), green (TX), yellow (RESET), black (NC), red (NC) -- but **colors vary between manufacturers and batches**. Always identify wires by position, not color.
+
+#### Connecting the cable
+
+The easiest approach is to cut the connector off one end of the ribbon cable, strip each wire, and insert them individually into the breadboard. You only need to connect 3 of the 8 wires:
 
 ```
-PMS5003        ESP32
--------        -----
-VCC  ---------> 5V  (VIN pin -- the PMS5003 needs 5V, not 3.3V!)
-GND  ---------> GND
-TX   ---------> GPIO 16 (ESP32 RX2)
-RX   ---------> GPIO 17 (ESP32 TX2)
+PMS5003 cable          ESP32
+(by pin position)
+--------------         -----
+Pin 1 (VCC) ---------> VIN (5V)  -- NOT 3.3V!
+Pin 2 (GND) ---------> GND
+Pin 5 (TX)  ---------> GPIO 16 (ESP32 RX2)
 ```
+
+Leave pins 3, 4, 6, 7, and 8 unconnected (you can trim or tape them off).
 
 **Important notes:**
-- The PMS5003 requires **5V power**. Connect it to the ESP32's VIN/5V pin, NOT the 3.3V pin. The 3.3V pin cannot supply enough current for the PMS5003's fan and laser.
-- The PMS5003's TX pin connects to the ESP32's RX pin and vice versa (they cross over).
-- Leave the other PMS5003 pins (SET, RESET, etc.) unconnected.
+- The PMS5003 requires **5V power**. Connect pin 1 to the ESP32's VIN/5V pin, NOT the 3.3V pin. The 3.3V pin cannot supply enough current for the PMS5003's fan and laser.
+- The PMS5003's TX (pin 5) connects to the ESP32's **RX** pin (they cross over -- transmit goes to receive).
+- Pin 4 (RX) is not needed because this project only reads data from the sensor, it doesn't send commands to it.
+- When you cut the cable, keep track of which end is pin 1. The ribbon cable wires are in order, so pin 1 is on one edge and pin 8 is on the other.
 
 ### Complete Wiring Diagram
 
@@ -102,10 +125,9 @@ RX   ---------> GPIO 17 (ESP32 TX2)
   DHT22 DATA ---------->| GPIO 4           |
   DHT22 GND  ---------->| GND              |
                          |                  |
-  PMS5003 VCC --------->| VIN (5V)         |
-  PMS5003 GND --------->| GND              |
-  PMS5003 TX  --------->| GPIO 16 (RX2)    |
-  PMS5003 RX  --------->| GPIO 17 (TX2)    |
+  PMS5003 Pin 1 (VCC) ->| VIN (5V)         |
+  PMS5003 Pin 2 (GND) ->| GND              |
+  PMS5003 Pin 5 (TX)  ->| GPIO 16 (RX2)    |
                          +------------------+
 ```
 
@@ -178,10 +200,10 @@ PlatformIO will:
 3. Press the **RST** (reset) button on your ESP32 board.
 4. You should see output like:
    ```
-   Connected! Open http://192.168.1.42
+   Connected! Open http://<your-ip>
    History buffer: 5040 points (118 KB)
    ```
-5. Note this IP address -- you'll use it to view the dashboard.
+5. Note this IP address (assigned by your router via DHCP, so it may change after a router reboot) -- you'll use it to view the dashboard.
 
 > **Tip:** If you don't see any output, make sure the baud rate is 115200 and try pressing the reset button again. You can also use any other serial terminal (e.g., `screen /dev/ttyUSB0 115200` on macOS/Linux) instead of the PlatformIO monitor.
 
@@ -212,7 +234,7 @@ By default, the ESP32 gets a dynamic IP address from your router via DHCP. This 
 
 1. Make sure your phone/computer is on the **same WiFi network** as the ESP32.
 2. Open any web browser.
-3. Type the ESP32's IP address in the address bar (e.g., `http://192.168.1.42`).
+3. Type the ESP32's IP address in the address bar (e.g., `http://<esp32-ip>`).
 4. The dashboard loads and auto-refreshes every 30 seconds.
 
 ### What You'll See
@@ -276,8 +298,8 @@ airqualitymonitor/
 
 | URL | What It Returns |
 |-----|-----------------|
-| `http://<ip>/` | Interactive dashboard with live readings, charts, and download button |
-| `http://<ip>/data.csv` | Raw CSV file of all stored history (for programmatic access) |
+| `http://<esp32-ip>/` | Interactive dashboard with live readings, charts, and download button |
+| `http://<esp32-ip>/data.csv` | Raw CSV file of all stored history (for programmatic access) |
 
 ## Troubleshooting
 
@@ -297,8 +319,8 @@ airqualitymonitor/
 
 ### PMS5003 stuck on "warming up"
 
-- Check wiring: VCC to 5V (VIN), not 3.3V. GND to GND. TX to GPIO 16, RX to GPIO 17.
-- Make sure TX/RX aren't swapped (the PMS5003 TX goes to the ESP32 RX2).
+- Check wiring: Pin 1 (VCC) to 5V (VIN), not 3.3V. Pin 2 (GND) to GND. Pin 5 (TX) to GPIO 16.
+- Make sure you connected pin 5 (TX), not pin 4 (RX) -- count carefully from pin 1 at the edge of the ribbon cable.
 - The PMS5003 fan should spin visibly/audibly when powered. If it doesn't, it's not getting enough power.
 - Try a different USB power source -- some laptop USB ports can't supply enough current for both the ESP32 and the PMS5003 fan.
 
