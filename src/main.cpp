@@ -31,10 +31,10 @@
  *      reasonably current data without excessive network traffic.
  *
  * Memory budget (ESP32 has ~200-250 KB free after WiFi):
- *   - History buffer: 5,040 points x 24 bytes = ~121 KB
+ *   - History buffer: 5,040 points x 24 bytes = ~121 KB (heap-allocated)
  *   - Everything else (WiFi, stack, buffers):   ~80-130 KB
- *   This leaves comfortable headroom. If you need more, reduce
- *   HISTORY_MAX or increase the measurement interval.
+ *   This leaves comfortable headroom. If allocation fails at boot,
+ *   the buffer automatically shrinks to fit available memory.
  */
 
 // --- Libraries ---
@@ -119,9 +119,11 @@ WiFiServer server(80);
 //   Each DataPoint is 24 bytes (5 floats + 1 unsigned long).
 //   With a 2-minute cycle: 720 points/day x 7 days = 5,040 points.
 //   5,040 x 24 bytes = 120,960 bytes (~121 KB).
-//   The ESP32 has ~200-250 KB free after WiFi, so this fits.
+//   The ESP32 has ~200-250 KB free after WiFi, so this fits on the
+//   heap. The buffer is allocated in setup() with a fallback to
+//   smaller sizes if memory is tight.
 
-#define HISTORY_MAX 5040  // 7 days at 1 sample per 2-minute cycle
+#define HISTORY_MAX 5040  // Target: 7 days at 1 sample per 2-minute cycle
 
 // Each data point stores all five sensor values plus a timestamp.
 // The timestamp is "millis() / 1000" (seconds since boot) rather
@@ -137,12 +139,31 @@ struct DataPoint {
   unsigned long ts;  // Seconds since boot (millis()/1000)
 };
 
-// The history array lives in global memory (BSS segment). It's
-// zero-initialized at boot, and we track how much is filled with
-// historyCount.
-DataPoint history[HISTORY_MAX];
-int historyHead = 0;    // Next position to write
-int historyCount = 0;   // How many valid entries (0..HISTORY_MAX)
+// The history array is allocated on the HEAP at startup (in setup())
+// rather than as a global array. Global arrays go into the BSS segment
+// of DRAM, which is limited to ~160 KB and shared with WiFi and the
+// framework. The heap can use more of the ESP32's total 520 KB SRAM,
+// so a ~121 KB buffer fits comfortably there but overflows BSS.
+//
+// We use a pointer here and call malloc() in setup(). If allocation
+// fails (not enough free heap), we fall back to a smaller buffer.
+DataPoint* history = nullptr;
+int historyMax = HISTORY_MAX;   // Actual capacity (may shrink on alloc failure)
+int historyHead = 0;            // Next position to write
+int historyCount = 0;           // How many valid entries (0..historyMax)
+
+// ============================================================
+// Sensor Reading (cached values)
+// ============================================================
+
+// We cache the last successful sensor readings in global variables.
+// This way the web page always has *something* to display, even if
+// a sensor temporarily fails to read. NAN (Not A Number) is used
+// as the initial "no data yet" value for the DHT readings.
+float lastTemp = NAN;
+float lastHumidity = NAN;
+bool pmsReady = false;    // Has the PMS5003 delivered at least one reading?
+PMS::DATA lastPms;        // Last successful particulate reading
 
 /*
  * recordDataPoint() - Save the current sensor readings to the history buffer.
@@ -154,6 +175,8 @@ int historyCount = 0;   // How many valid entries (0..HISTORY_MAX)
  * data point is silently overwritten -- no memory allocation needed.
  */
 void recordDataPoint() {
+  if (!history) return;  // Allocation failed in setup(); no history available
+
   DataPoint dp;
   dp.temp     = lastTemp;       // May be NAN if DHT22 hasn't read yet
   dp.humidity = lastHumidity;   // May be NAN if DHT22 hasn't read yet
@@ -164,16 +187,13 @@ void recordDataPoint() {
 
   // Write to the current head position and advance.
   history[historyHead] = dp;
-  historyHead = (historyHead + 1) % HISTORY_MAX;
+  historyHead = (historyHead + 1) % historyMax;
 
-  // Track how many slots are occupied (caps at HISTORY_MAX).
-  if (historyCount < HISTORY_MAX) {
+  // Track how many slots are occupied (caps at historyMax).
+  if (historyCount < historyMax) {
     historyCount++;
   }
 }
-
-// Forward declaration -- we need lastTemp etc. before readSensors defines them,
-// but they're declared right below this comment in the Sensor Reading section.
 
 /*
  * connectWiFi() - Attempt to join the WiFi network.
@@ -203,6 +223,31 @@ void setup() {
   // Start the USB serial connection at 115200 baud. This lets us print
   // debug messages that you can read in the PlatformIO Serial Monitor.
   Serial.begin(115200);
+
+  // --- Allocate the history buffer on the heap ---
+  // We do this early, before WiFi grabs a large chunk of heap for its
+  // internal buffers. If the full 5,040-point buffer doesn't fit, we
+  // try progressively smaller sizes so the monitor still works (just
+  // with fewer days of history).
+  history = (DataPoint*)malloc(historyMax * sizeof(DataPoint));
+  if (!history) {
+    // Full buffer didn't fit -- try half (3.5 days)
+    historyMax = HISTORY_MAX / 2;
+    history = (DataPoint*)malloc(historyMax * sizeof(DataPoint));
+  }
+  if (!history) {
+    // Still didn't fit -- try 1 day (720 points = ~17 KB)
+    historyMax = 720;
+    history = (DataPoint*)malloc(historyMax * sizeof(DataPoint));
+  }
+  if (history) {
+    memset(history, 0, historyMax * sizeof(DataPoint));
+    Serial.printf("History buffer: %d points (%d KB)\n",
+      historyMax, (int)(historyMax * sizeof(DataPoint) / 1024));
+  } else {
+    historyMax = 0;
+    Serial.println("WARNING: History buffer allocation failed, no charting");
+  }
 
   // Initialize the PMS5003 serial connection.
   // The PMS5003 communicates at 9600 baud with standard settings (8 data
@@ -240,15 +285,6 @@ void setup() {
 // ============================================================
 // Sensor Reading
 // ============================================================
-
-// We cache the last successful sensor readings in global variables.
-// This way the web page always has *something* to display, even if
-// a sensor temporarily fails to read. NAN (Not A Number) is used
-// as the initial "no data yet" value for the DHT readings.
-float lastTemp = NAN;
-float lastHumidity = NAN;
-bool pmsReady = false;    // Has the PMS5003 delivered at least one reading?
-PMS::DATA lastPms;        // Last successful particulate reading
 
 // --- PMS5003 duty-cycle state machine ---
 // The sensor alternates between two states:
@@ -514,10 +550,10 @@ void sendDashboardPage(WiFiClient& client) {
   // If it IS full, the oldest entry is at historyHead (because that's
   // the next position to be overwritten).
   unsigned long nowSec = millis() / 1000;
-  int start = (historyCount < HISTORY_MAX) ? 0 : historyHead;
+  int start = (historyCount < historyMax) ? 0 : historyHead;
 
   for (int i = 0; i < historyCount; i++) {
-    int idx = (start + i) % HISTORY_MAX;
+    int idx = (start + i) % historyMax;
     DataPoint& dp = history[idx];
 
     // Convert the timestamp from "seconds since boot" to
@@ -614,10 +650,10 @@ void sendDashboardPage(WiFiClient& client) {
   // ---- Download button and footer ----
   sendChunk(client,
     "<button class='btn' onclick='downloadCSV()'>Download CSV</button>"
-    "<p class='info'>%d data points stored (up to %d max = 7 days). "
+    "<p class='info'>%d data points stored (up to %d max ~ %d days). "
     "Page refreshes every 30 seconds.</p>"
     "</body></html>",
-    historyCount, HISTORY_MAX);
+    historyCount, historyMax, historyMax / 720);
 }
 
 /*
@@ -643,10 +679,10 @@ void sendCSVData(WiFiClient& client) {
   client.println("seconds_ago,temperature,humidity,pm1_0,pm2_5,pm10");
 
   unsigned long nowSec = millis() / 1000;
-  int start = (historyCount < HISTORY_MAX) ? 0 : historyHead;
+  int start = (historyCount < historyMax) ? 0 : historyHead;
 
   for (int i = 0; i < historyCount; i++) {
-    int idx = (start + i) % HISTORY_MAX;
+    int idx = (start + i) % historyMax;
     DataPoint& dp = history[idx];
     long ago = (long)(nowSec - dp.ts);
 

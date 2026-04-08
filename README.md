@@ -10,7 +10,7 @@ The ESP32 reads sensor data, stores up to **7 days of history** in memory, and h
 - **Historical charts** -- interactive line charts (powered by [Chart.js](https://www.chartjs.org/)) showing how each metric has changed over time, with hover tooltips for exact values
 - **CSV download** -- a button to export all stored data as a CSV file you can open in Excel, Google Sheets, or feed into a Python script
 
-The ESP32 records a data point every 2 minutes and keeps the most recent 5,040 points (~7 days) in a circular buffer in RAM. When the buffer is full, the oldest points are silently overwritten. The page auto-refreshes every 30 seconds.
+The ESP32 records a data point every 2 minutes and keeps the most recent 5,040 points (~7 days) in a circular buffer in RAM. When the buffer is full, the oldest points are silently overwritten. If memory is tight (e.g., on boards with less free RAM), the buffer automatically shrinks at boot to fit available memory. The page auto-refreshes every 30 seconds.
 
 ### Measurements
 
@@ -173,16 +173,17 @@ PlatformIO will:
 
 ### 7. Find the ESP32's IP Address
 
-1. After uploading, click the **plug icon** in the PlatformIO toolbar to open the Serial Monitor.
-2. Set the baud rate to **115200** (dropdown in the top-right of the monitor panel).
+1. After uploading, click the **plug icon** in the PlatformIO toolbar to open the Serial Monitor. This opens a terminal panel at the bottom of VS Code (not a separate GUI window).
+2. The baud rate should default to **115200** (matching `monitor_speed` in `platformio.ini`). If you see garbled text, check that the baud rate is correct -- you can set it by adding or updating `monitor_speed = 115200` in `platformio.ini`.
 3. Press the **RST** (reset) button on your ESP32 board.
 4. You should see output like:
    ```
    Connected! Open http://192.168.1.42
+   History buffer: 5040 points (118 KB)
    ```
 5. Note this IP address -- you'll use it to view the dashboard.
 
-> **Tip:** If you don't see any output, make sure the baud rate is set to 115200 and try pressing the reset button again.
+> **Tip:** If you don't see any output, make sure the baud rate is 115200 and try pressing the reset button again. You can also use any other serial terminal (e.g., `screen /dev/ttyUSB0 115200` on macOS/Linux) instead of the PlatformIO monitor.
 
 ## WiFi Setup
 
@@ -247,7 +248,11 @@ PM2.5 is the most important health metric. Common sources of high PM2.5 include 
 
 The ESP32 stores up to **5,040 data points** in a circular buffer in RAM (one point every ~2 minutes = ~7 days of history). When the buffer is full, the oldest point is overwritten by the newest. History is lost when the ESP32 loses power or reboots -- there is no persistent storage.
 
-**Memory budget:** Each data point is 24 bytes. The full buffer uses ~121 KB out of the ESP32's ~200--250 KB of free RAM (after WiFi overhead), leaving comfortable headroom.
+**Memory budget:** Each data point is 24 bytes. The full buffer uses ~121 KB of heap memory. The buffer is allocated dynamically at startup -- if the full 7-day buffer doesn't fit (unlikely on a standard ESP32-WROOM-32, but possible on boards with less free RAM), it automatically falls back to 3.5 days, then 1 day. The Serial Monitor prints the actual buffer size at boot:
+
+```
+History buffer: 5040 points (118 KB)
+```
 
 ## Project Structure
 
