@@ -2,6 +2,8 @@
 
 An air quality monitoring station built with an ESP32, a DHT22 temperature/humidity sensor, and a PMS5003 particulate matter sensor. It serves a live dashboard over WiFi that you can view from any device on your network.
 
+![Dashboard screenshot](docs/dashboard.png)
+
 ## What It Does
 
 The ESP32 reads sensor data, stores up to **7 days of history** in memory, and hosts an interactive dashboard over WiFi. Open it on your phone, tablet, or computer to see:
