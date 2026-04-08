@@ -4,13 +4,23 @@ An air quality monitoring station built with an ESP32, a DHT22 temperature/humid
 
 ## What It Does
 
-The ESP32 reads sensor data and hosts a tiny web page that auto-refreshes every 30 seconds. Open the page on your phone, tablet, or computer to see:
+The ESP32 reads sensor data, stores up to **7 days of history** in memory, and hosts an interactive dashboard over WiFi. Open it on your phone, tablet, or computer to see:
 
-- **Temperature** (Celsius)
-- **Humidity** (%)
-- **PM1.0** -- particles <= 1.0 micrometers (micrograms per cubic meter)
-- **PM2.5** -- particles <= 2.5 micrometers (the most health-relevant measurement)
-- **PM10** -- particles <= 10 micrometers
+- **Live readings** -- temperature, humidity, PM1.0, PM2.5, and PM10, displayed in color-coded cards (green/orange/red based on air quality level)
+- **Historical charts** -- interactive line charts (powered by [Chart.js](https://www.chartjs.org/)) showing how each metric has changed over time, with hover tooltips for exact values
+- **CSV download** -- a button to export all stored data as a CSV file you can open in Excel, Google Sheets, or feed into a Python script
+
+The ESP32 records a data point every 2 minutes and keeps the most recent 5,040 points (~7 days) in a circular buffer in RAM. When the buffer is full, the oldest points are silently overwritten. The page auto-refreshes every 30 seconds.
+
+### Measurements
+
+| Metric | What It Measures |
+|--------|-----------------|
+| **Temperature** | Air temperature in Celsius |
+| **Humidity** | Relative humidity (%) |
+| **PM1.0** | Particles <= 1.0 micrometers (ug/m3) |
+| **PM2.5** | Particles <= 2.5 micrometers (ug/m3) -- the most health-relevant measurement |
+| **PM10** | Particles <= 10 micrometers (ug/m3) |
 
 PM2.5 is the number most commonly reported in air quality forecasts. Levels below 12 ug/m3 are considered good; above 35 is unhealthy for sensitive groups; above 55 is unhealthy for everyone.
 
@@ -206,22 +216,21 @@ By default, the ESP32 gets a dynamic IP address from your router via DHCP. This 
 
 ### What You'll See
 
-The dashboard displays a clean, minimal page with:
+The dashboard has three sections:
 
-**Normal operation:**
-```
-ESP32 Air Quality Station
+**1. Live readings** -- Color-coded cards at the top show the most recent sensor values. The PM2.5 card changes color based on air quality: green (good, 0--12 ug/m3), orange (moderate, 12--35 ug/m3), or red (unhealthy, >35 ug/m3).
 
-Temperature: 23.4 C
-Humidity: 45.2 %
-PM1.0: 5 ug/m3
-PM2.5: 8 ug/m3
-PM10: 12 ug/m3
-```
+**2. Historical charts** -- Two interactive line charts:
+   - **Temperature & Humidity** -- dual-axis chart with temperature on the left (°C) and humidity on the right (%). Hover over any point to see the exact value and time.
+   - **Particulate Matter** -- PM1.0, PM2.5, and PM10 plotted together so you can spot trends and correlations. The X axis shows time labels (hours or days, depending on how much data is stored).
 
-**Sensor errors:** If the DHT22 can't be read (bad wiring, sensor failure), you'll see a red "Temperature/Humidity sensor error" message instead of the values. The particulate readings will still display normally.
+**3. Download button** -- Click **"Download CSV"** to save all stored data as a CSV file (`airquality.csv`). The CSV has columns: `seconds_ago, temperature, humidity, pm1_0, pm2_5, pm10`. You can also fetch the CSV programmatically at `http://<esp32-ip>/data.csv`.
 
-**PMS5003 warming up:** The PMS5003 needs about 30 seconds after power-on to stabilize its fan and laser. During this time, you'll see a "Particulate sensor warming up..." message instead of PM values.
+A footer line shows how many data points are currently stored (e.g., "1,234 of 5,040 max = 7 days").
+
+**Sensor errors:** If the DHT22 can't be read (bad wiring, sensor failure), you'll see a red "DHT22 error" card instead of temperature/humidity values. The particulate readings and charts still work normally.
+
+**PMS5003 warming up:** The PMS5003 needs about 30 seconds after power-on to stabilize its fan and laser. During this time, you'll see a "Warming up..." card instead of PM values. The charts will be empty until the first reading arrives.
 
 ### Understanding the Readings
 
@@ -233,6 +242,12 @@ PM10: 12 ug/m3
 | **PM10** | Coarse particle pollution | 0--54 ug/m3 | 54--154 ug/m3 | >154 ug/m3 |
 
 PM2.5 is the most important health metric. Common sources of high PM2.5 include cooking, candles, wildfires, traffic, and construction dust.
+
+### Data Retention
+
+The ESP32 stores up to **5,040 data points** in a circular buffer in RAM (one point every ~2 minutes = ~7 days of history). When the buffer is full, the oldest point is overwritten by the newest. History is lost when the ESP32 loses power or reboots -- there is no persistent storage.
+
+**Memory budget:** Each data point is 24 bytes. The full buffer uses ~121 KB out of the ESP32's ~200--250 KB of free RAM (after WiFi overhead), leaving comfortable headroom.
 
 ## Project Structure
 
@@ -251,6 +266,13 @@ airqualitymonitor/
 |-- .gitignore
 +-- platformio.ini           # Build config and library dependencies
 ```
+
+### Web Endpoints
+
+| URL | What It Returns |
+|-----|-----------------|
+| `http://<ip>/` | Interactive dashboard with live readings, charts, and download button |
+| `http://<ip>/data.csv` | Raw CSV file of all stored history (for programmatic access) |
 
 ## Troubleshooting
 
@@ -353,7 +375,7 @@ You can adjust the duty cycle constants in `main.cpp` to trade freshness for pow
 - **JSON API**: Add a `/api/data` endpoint for integration with Home Assistant, Grafana, or other tools
 - **OTA updates**: Flash new firmware over WiFi instead of USB
 - **AQI calculation**: Convert raw PM2.5 to the EPA Air Quality Index (a 0--500 scale)
-- **Data logging**: Store readings on the ESP32's flash (SPIFFS/LittleFS) or push to InfluxDB/MQTT
+- **Persistent storage**: Save history to the ESP32's flash (SPIFFS/LittleFS) so data survives reboots, or push to InfluxDB/MQTT
 - **Status LED**: Wire up an RGB LED that changes color based on air quality (green/yellow/red)
 
 ## License

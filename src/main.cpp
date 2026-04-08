@@ -2,8 +2,9 @@
  * ESP32 Air Quality Monitor
  *
  * This program reads temperature, humidity, and particulate matter (PM)
- * data from two sensors and serves the readings as a web page you can
- * view from any device on your WiFi network.
+ * data from two sensors, stores a rolling history in memory, and serves
+ * an interactive dashboard with charts that you can view from any device
+ * on your WiFi network.
  *
  * Hardware:
  *   - ESP32 dev board
@@ -19,10 +20,21 @@
  *        to get stable readings, then sleeps for a configurable period
  *        to save power (~100 mA). By default it sleeps for 90 seconds,
  *        giving a 2-minute measurement cycle.
- *   3. When you visit the ESP32's IP address in a browser, it builds
- *      an HTML page with the latest readings and sends it back.
- *   4. The page auto-refreshes every 30 seconds so you always see
+ *   3. Each time a new PMS reading arrives, a data point is stored in a
+ *      circular buffer in RAM. The buffer holds up to 7 days of history
+ *      at a 2-minute interval (5,040 points, ~121 KB).
+ *   4. When you visit the ESP32's IP address in a browser, it streams
+ *      an HTML page with live readings, interactive Chart.js charts
+ *      showing the full history, and a button to download all data as
+ *      a CSV file.
+ *   5. The page auto-refreshes every 30 seconds so you always see
  *      reasonably current data without excessive network traffic.
+ *
+ * Memory budget (ESP32 has ~200-250 KB free after WiFi):
+ *   - History buffer: 5,040 points x 24 bytes = ~121 KB
+ *   - Everything else (WiFi, stack, buffers):   ~80-130 KB
+ *   This leaves comfortable headroom. If you need more, reduce
+ *   HISTORY_MAX or increase the measurement interval.
  */
 
 // --- Libraries ---
@@ -85,6 +97,83 @@ WiFiServer server(80);
 // The DHT22's internal sampling rate is once every 2 seconds.
 // Reading it faster just returns the same value and wastes CPU time.
 #define DHT_READ_MS 2000
+
+// ============================================================
+// History Buffer (Circular / Ring Buffer)
+// ============================================================
+//
+// We store past sensor readings in a fixed-size array that wraps
+// around when full. This is called a "circular buffer" or "ring
+// buffer". It works like this:
+//
+//   - New data is written at position `historyHead`.
+//   - After writing, historyHead advances by 1 (wrapping to 0
+//     at the end of the array).
+//   - `historyCount` tracks how many slots are filled (up to
+//     HISTORY_MAX). Once full, new data overwrites the oldest.
+//
+// This gives us O(1) insertion with zero memory allocation --
+// critical on a microcontroller with no garbage collector.
+//
+// Memory math:
+//   Each DataPoint is 24 bytes (5 floats + 1 unsigned long).
+//   With a 2-minute cycle: 720 points/day x 7 days = 5,040 points.
+//   5,040 x 24 bytes = 120,960 bytes (~121 KB).
+//   The ESP32 has ~200-250 KB free after WiFi, so this fits.
+
+#define HISTORY_MAX 5040  // 7 days at 1 sample per 2-minute cycle
+
+// Each data point stores all five sensor values plus a timestamp.
+// The timestamp is "millis() / 1000" (seconds since boot) rather
+// than wall-clock time because the ESP32 doesn't have a real-time
+// clock. The dashboard converts this to relative time labels like
+// "2h ago" for the chart axis.
+struct DataPoint {
+  float temp;       // Temperature in Celsius
+  float humidity;   // Relative humidity in %
+  float pm1_0;      // PM1.0 in ug/m3
+  float pm2_5;      // PM2.5 in ug/m3
+  float pm10;       // PM10 in ug/m3
+  unsigned long ts;  // Seconds since boot (millis()/1000)
+};
+
+// The history array lives in global memory (BSS segment). It's
+// zero-initialized at boot, and we track how much is filled with
+// historyCount.
+DataPoint history[HISTORY_MAX];
+int historyHead = 0;    // Next position to write
+int historyCount = 0;   // How many valid entries (0..HISTORY_MAX)
+
+/*
+ * recordDataPoint() - Save the current sensor readings to the history buffer.
+ *
+ * Called once per PMS5003 measurement cycle (~every 2 minutes).
+ * Uses the latest cached DHT22 values and the just-received PMS data.
+ *
+ * If the buffer is full (historyCount == HISTORY_MAX), the oldest
+ * data point is silently overwritten -- no memory allocation needed.
+ */
+void recordDataPoint() {
+  DataPoint dp;
+  dp.temp     = lastTemp;       // May be NAN if DHT22 hasn't read yet
+  dp.humidity = lastHumidity;   // May be NAN if DHT22 hasn't read yet
+  dp.pm1_0    = lastPms.PM_AE_UG_1_0;
+  dp.pm2_5    = lastPms.PM_AE_UG_2_5;
+  dp.pm10     = lastPms.PM_AE_UG_10_0;
+  dp.ts       = millis() / 1000;
+
+  // Write to the current head position and advance.
+  history[historyHead] = dp;
+  historyHead = (historyHead + 1) % HISTORY_MAX;
+
+  // Track how many slots are occupied (caps at HISTORY_MAX).
+  if (historyCount < HISTORY_MAX) {
+    historyCount++;
+  }
+}
+
+// Forward declaration -- we need lastTemp etc. before readSensors defines them,
+// but they're declared right below this comment in the Sensor Reading section.
 
 /*
  * connectWiFi() - Attempt to join the WiFi network.
@@ -163,8 +252,8 @@ PMS::DATA lastPms;        // Last successful particulate reading
 
 // --- PMS5003 duty-cycle state machine ---
 // The sensor alternates between two states:
-//   AWAKE  – fan spinning, laser on, actively sending data frames
-//   ASLEEP – fan and laser off, drawing almost no current
+//   AWAKE  -- fan spinning, laser on, actively sending data frames
+//   ASLEEP -- fan and laser off, drawing almost no current
 // We track the state and when we entered it so we know when to switch.
 bool pmsAwake = true;                // Starts awake after power-on
 unsigned long pmsStateStart = 0;     // millis() when we entered the current state
@@ -182,13 +271,16 @@ unsigned long lastDhtRead = 0;
  *        We only update the cache when BOTH temp and humidity are valid.
  *
  * PMS5003: Runs a duty cycle to save power:
- *   1. AWAKE  – fan and laser are on. We call pms.read() to grab data.
- *              After PMS_WAKE_MS (30 s) we put the sensor to sleep.
- *   2. ASLEEP – fan and laser are off (~0 mA). After PMS_SLEEP_MS (90 s)
- *              we wake it up and go back to step 1.
+ *   1. AWAKE  -- fan and laser are on. We call pms.read() to grab data.
+ *               After PMS_WAKE_MS (30 s) we put the sensor to sleep.
+ *   2. ASLEEP -- fan and laser are off (~0 mA). After PMS_SLEEP_MS (90 s)
+ *               we wake it up and go back to step 1.
  *
  *   The first cycle after boot skips the initial sleep so you get a
  *   reading within 30 seconds of power-on.
+ *
+ *   When a new PMS reading arrives, we also record a data point to
+ *   the history buffer for charting.
  */
 void readSensors() {
   // ---- DHT22 (throttled) ----
@@ -221,8 +313,15 @@ void readSensors() {
       pmsReady = true;
     }
 
-    // After PMS_WAKE_MS of run time, put the sensor to sleep.
+    // After PMS_WAKE_MS of run time, put the sensor to sleep and
+    // record the latest readings to the history buffer.
     if (elapsed >= PMS_WAKE_MS) {
+      // Save a data point right before sleeping -- this captures the
+      // most recent (and most stable) reading from this wake cycle.
+      if (pmsReady) {
+        recordDataPoint();
+      }
+
       pms.sleep();   // Sends a command over serial to turn off the fan/laser
       pmsAwake = false;
       pmsStateStart = millis();
@@ -240,81 +339,326 @@ void readSensors() {
 }
 
 // ============================================================
-// Web Page Generation
+// Web Server - Streaming HTML Response
 // ============================================================
+//
+// The dashboard page is too large to fit in a single buffer because
+// it includes all the history data for the charts. Instead of
+// building the entire page in memory, we "stream" it: send it to
+// the browser in small pieces, one after another.
+//
+// Think of it like reading a book aloud -- you don't memorize the
+// whole book first, you read one page at a time. The browser
+// assembles the pieces into the complete page.
+//
+// We use a small 256-byte buffer for formatting individual lines
+// (like one row of chart data), send that chunk, then reuse the
+// same buffer for the next line.
 
-// We use a fixed-size buffer on the stack for the HTML page instead of
-// Arduino's String class. String concatenation (+=) causes repeated heap
-// allocations that fragment memory over time on the ESP32. snprintf()
-// writes directly into a pre-allocated buffer -- no fragmentation.
-static char pageBuf[1024];
+// Small reusable buffer for formatting individual lines of output.
+// This is much more memory-efficient than building the whole page
+// in one giant buffer.
+static char lineBuf[256];
 
 /*
- * htmlPage() - Build the HTML dashboard from the latest sensor cache.
+ * sendChunk() - Format a string and send it to the client immediately.
  *
- * Returns a pointer to the static buffer containing the complete HTML.
- * The page includes:
- *   - Temperature and humidity (or an error message if sensor failed)
- *   - PM1.0, PM2.5, and PM10 readings (or "warming up" if no data yet)
- *   - Auto-refresh every 30 seconds via <meta http-equiv='refresh'>
+ * Works like printf() but sends directly to the WiFi client instead
+ * of printing to the serial monitor. Uses our small lineBuf to
+ * format the string, then calls client.print() to transmit it.
+ *
+ * The "..." means this function accepts a variable number of arguments,
+ * just like printf/snprintf. For example:
+ *   sendChunk(client, "<p>Temperature: %.1f</p>", 23.4);
  */
-const char* htmlPage() {
-  // Build each section into small temporary buffers first, then combine
-  // them into the final page. This keeps each snprintf() call readable.
-  char tempStr[64];
-  char humStr[64];
-  char pmsStr[256];
-
-  // Temperature & Humidity section
-  if (isnan(lastTemp) || isnan(lastHumidity)) {
-    // No valid reading yet -- show an error message in red
-    snprintf(tempStr, sizeof(tempStr), "<p class='error'>Temperature/Humidity sensor error</p>");
-    humStr[0] = '\0';  // Empty string -- nothing to show for humidity
-  } else {
-    // %.1f formats the float to 1 decimal place (e.g., "23.4")
-    snprintf(tempStr, sizeof(tempStr), "<p><b>Temperature:</b> %.1f &deg;C</p>", lastTemp);
-    snprintf(humStr, sizeof(humStr), "<p><b>Humidity:</b> %.1f %%</p>", lastHumidity);
-  }
-
-  // Particulate Matter section
-  if (!pmsReady) {
-    // The PMS5003 needs ~30 seconds after power-on to stabilize its
-    // internal fan and laser. Until we get the first reading, show
-    // a "warming up" message.
-    snprintf(pmsStr, sizeof(pmsStr), "<p class='error'>Particulate sensor warming up...</p>");
-  } else {
-    // PM values are unsigned integers representing micrograms per
-    // cubic meter of air (ug/m3). %u formats an unsigned int.
-    //   PM1.0  = particles <= 1.0 micrometers
-    //   PM2.5  = particles <= 2.5 micrometers (the most health-relevant)
-    //   PM10   = particles <= 10 micrometers
-    snprintf(pmsStr, sizeof(pmsStr),
-      "<p><b>PM1.0:</b> %u &micro;g/m&sup3;</p>"
-      "<p><b>PM2.5:</b> %u &micro;g/m&sup3;</p>"
-      "<p><b>PM10:</b> %u &micro;g/m&sup3;</p>",
-      lastPms.PM_AE_UG_1_0, lastPms.PM_AE_UG_2_5, lastPms.PM_AE_UG_10_0);
-  }
-
-  // Assemble the full HTML page.
-  // The <meta refresh> tag tells the browser to reload the page every
-  // 30 seconds. This is a good balance: the data stays reasonably
-  // current without flooding the ESP32 with HTTP requests.
-  snprintf(pageBuf, sizeof(pageBuf),
-    "<!DOCTYPE html><html><head>"
-    "<meta http-equiv='refresh' content='30'>"
-    "<style>body{font-family:Arial;margin:40px;}h1{color:#333;}.error{color:#c00;}</style>"
-    "</head><body>"
-    "<h1>ESP32 Air Quality Station</h1>"
-    "%s%s%s"
-    "</body></html>",
-    tempStr, humStr, pmsStr);
-
-  return pageBuf;
+void sendChunk(WiFiClient& client, const char* fmt, ...) {
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(lineBuf, sizeof(lineBuf), fmt, args);
+  va_end(args);
+  client.print(lineBuf);
 }
 
-// ============================================================
-// Web Server
-// ============================================================
+/*
+ * sendDashboardPage() - Stream the full HTML dashboard to the client.
+ *
+ * This function sends the page in sections:
+ *   1. HTTP headers
+ *   2. HTML head (CSS, Chart.js library link, meta-refresh)
+ *   3. Current sensor readings
+ *   4. Chart canvases (empty <canvas> elements the JS will draw into)
+ *   5. History data as JavaScript arrays (one line per data point)
+ *   6. Chart.js configuration and initialization
+ *   7. CSV download button and its JavaScript
+ *   8. HTML closing tags
+ *
+ * The history data is the bulk of the page. For 7 days of data
+ * (~5,040 points), this section alone is ~100-150 KB of text.
+ * Streaming lets us send it without ever holding it all in RAM.
+ */
+void sendDashboardPage(WiFiClient& client) {
+  // ---- HTTP headers ----
+  client.println("HTTP/1.1 200 OK");
+  client.println("Content-Type: text/html");
+  client.println("Connection: close");
+  client.println();
+
+  // ---- HTML head ----
+  // We load Chart.js from a CDN (content delivery network). This is a
+  // popular open-source charting library that runs in the browser. The
+  // ESP32 doesn't do any chart rendering -- it just sends the data and
+  // the browser's JavaScript engine does all the drawing work.
+  //
+  // The chartjs-adapter-date-fns import lets Chart.js understand time-
+  // based X axes so it can show labels like "12:00" or "Mon".
+  client.print(
+    "<!DOCTYPE html><html><head>"
+    "<meta charset='UTF-8'>"
+    "<meta http-equiv='refresh' content='30'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>Air Quality Monitor</title>"
+    "<script src='https://cdn.jsdelivr.net/npm/chart.js@4'></script>"
+    "<script src='https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3'></script>"
+    "<style>"
+      "body{font-family:Arial,sans-serif;margin:20px;max-width:900px;margin:0 auto;padding:20px;}"
+      "h1{color:#333;} h2{color:#555;margin-top:30px;}"
+      ".readings{display:flex;flex-wrap:wrap;gap:15px;margin:15px 0;}"
+      ".card{background:#f8f9fa;border-radius:8px;padding:15px 20px;"
+        "border-left:4px solid #4CAF50;min-width:140px;}"
+      ".card.warn{border-left-color:#FF9800;}"
+      ".card.error{border-left-color:#f44336;}"
+      ".card .label{font-size:0.85em;color:#666;}"
+      ".card .value{font-size:1.4em;font-weight:bold;color:#333;}"
+      ".chart-container{position:relative;height:250px;margin:15px 0;}"
+      "canvas{width:100%!important;}"
+      ".btn{display:inline-block;padding:10px 20px;background:#4CAF50;"
+        "color:#fff;border:none;border-radius:4px;cursor:pointer;"
+        "font-size:1em;margin-top:10px;text-decoration:none;}"
+      ".btn:hover{background:#388E3C;}"
+      ".info{color:#888;font-size:0.85em;margin-top:5px;}"
+    "</style>"
+    "</head><body>"
+    "<h1>ESP32 Air Quality Station</h1>"
+  );
+
+  // ---- Current readings cards ----
+  // Show the latest values in colored cards at the top of the page.
+  if (isnan(lastTemp) || isnan(lastHumidity)) {
+    client.print("<div class='readings'><div class='card error'>"
+      "<div class='label'>Sensor</div>"
+      "<div class='value'>DHT22 error</div></div></div>");
+  } else {
+    sendChunk(client,
+      "<div class='readings'>"
+      "<div class='card'><div class='label'>Temperature</div>"
+      "<div class='value'>%.1f &deg;C</div></div>"
+      "<div class='card'><div class='label'>Humidity</div>"
+      "<div class='value'>%.1f %%</div></div>",
+      lastTemp, lastHumidity);
+
+    if (!pmsReady) {
+      client.print(
+        "<div class='card warn'><div class='label'>PM Status</div>"
+        "<div class='value'>Warming up...</div></div></div>");
+    } else {
+      // Color the PM2.5 card based on air quality level:
+      //   Green  (good):     0 - 12 ug/m3
+      //   Orange (moderate): 12 - 35 ug/m3
+      //   Red    (unhealthy): > 35 ug/m3
+      const char* pmClass = lastPms.PM_AE_UG_2_5 <= 12 ? "card" :
+                            lastPms.PM_AE_UG_2_5 <= 35 ? "card warn" : "card error";
+      sendChunk(client,
+        "<div class='card'><div class='label'>PM1.0</div>"
+        "<div class='value'>%u &micro;g/m&sup3;</div></div>"
+        "<div class='%s'><div class='label'>PM2.5</div>"
+        "<div class='value'>%u &micro;g/m&sup3;</div></div>"
+        "<div class='card'><div class='label'>PM10</div>"
+        "<div class='value'>%u &micro;g/m&sup3;</div></div></div>",
+        lastPms.PM_AE_UG_1_0, pmClass,
+        lastPms.PM_AE_UG_2_5, lastPms.PM_AE_UG_10_0);
+    }
+  }
+
+  // ---- Chart canvases ----
+  // These are empty <canvas> elements. Chart.js will draw into them
+  // using the data arrays we define in the <script> section below.
+  // Each chart gets its own container div with a fixed height so
+  // the page layout doesn't jump around as charts load.
+  client.print(
+    "<h2>Temperature &amp; Humidity</h2>"
+    "<div class='chart-container'><canvas id='thChart'></canvas></div>"
+    "<h2>Particulate Matter</h2>"
+    "<div class='chart-container'><canvas id='pmChart'></canvas></div>"
+  );
+
+  // ---- History data as JavaScript arrays ----
+  // We write the history data directly into a <script> block as
+  // JavaScript arrays. The browser parses these and Chart.js uses
+  // them to draw the line charts.
+  //
+  // Each data point becomes one element in each array:
+  //   ts[i]   = seconds since boot (converted to a Date by JS)
+  //   tp[i]   = temperature
+  //   hu[i]   = humidity
+  //   p1[i]   = PM1.0
+  //   p25[i]  = PM2.5
+  //   p10[i]  = PM10
+  //
+  // We iterate through the circular buffer in chronological order
+  // (oldest to newest) by starting at the right offset.
+  client.print("<script>\n");
+  client.print("var ts=[],tp=[],hu=[],p1=[],p25=[],p10=[];\n");
+
+  // Walk the circular buffer from oldest to newest.
+  // If the buffer isn't full yet, start from index 0.
+  // If it IS full, the oldest entry is at historyHead (because that's
+  // the next position to be overwritten).
+  unsigned long nowSec = millis() / 1000;
+  int start = (historyCount < HISTORY_MAX) ? 0 : historyHead;
+
+  for (int i = 0; i < historyCount; i++) {
+    int idx = (start + i) % HISTORY_MAX;
+    DataPoint& dp = history[idx];
+
+    // Convert the timestamp from "seconds since boot" to
+    // "seconds ago" (relative to now). The JavaScript on the
+    // browser side will turn this into an absolute Date object
+    // by subtracting from the current time.
+    long ago = (long)(nowSec - dp.ts);
+
+    // Send one line per data point. Each line pushes values into
+    // the six arrays. We use isnan() to skip bad DHT readings --
+    // Chart.js handles null gracefully by leaving gaps in the line.
+    if (isnan(dp.temp)) {
+      sendChunk(client,
+        "ts.push(%ld);tp.push(null);hu.push(null);"
+        "p1.push(%.0f);p25.push(%.0f);p10.push(%.0f);\n",
+        ago, dp.pm1_0, dp.pm2_5, dp.pm10);
+    } else {
+      sendChunk(client,
+        "ts.push(%ld);tp.push(%.1f);hu.push(%.1f);"
+        "p1.push(%.0f);p25.push(%.0f);p10.push(%.0f);\n",
+        ago, dp.temp, dp.humidity, dp.pm1_0, dp.pm2_5, dp.pm10);
+    }
+  }
+
+  // ---- Chart.js initialization ----
+  // Convert "seconds ago" timestamps into JavaScript Date objects.
+  // Then create two charts: one for temp+humidity, one for PM values.
+  //
+  // Chart.js is configured with:
+  //   - Time-based X axis (shows hours/days depending on zoom)
+  //   - Responsive sizing (fills the container)
+  //   - Tooltips showing exact values on hover
+  //   - Smooth lines with no fill (clean look)
+  //   - spanGaps:true so missing DHT readings don't break the line
+  client.print(
+    "var now=new Date();\n"
+    "var labels=ts.map(function(s){return new Date(now.getTime()-s*1000);});\n"
+
+    // Temperature & Humidity chart
+    "new Chart(document.getElementById('thChart'),{type:'line',data:{"
+      "labels:labels,datasets:["
+        "{label:'Temp (\\u00B0C)',data:tp,borderColor:'#e74c3c',backgroundColor:'rgba(231,76,60,0.1)',"
+          "borderWidth:1.5,pointRadius:0,tension:0.3,spanGaps:true},"
+        "{label:'Humidity (%)',data:hu,borderColor:'#3498db',backgroundColor:'rgba(52,152,219,0.1)',"
+          "borderWidth:1.5,pointRadius:0,tension:0.3,yAxisID:'y1',spanGaps:true}"
+      "]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},"
+        "scales:{"
+          "x:{type:'time',time:{tooltipFormat:'MMM d, HH:mm',displayFormats:{hour:'HH:mm',day:'MMM d'}},"
+            "ticks:{maxTicksLimit:8}},"
+          "y:{position:'left',title:{display:true,text:'\\u00B0C'}},"
+          "y1:{position:'right',title:{display:true,text:'%'},grid:{drawOnChartArea:false}}"
+        "}"
+      "}});\n"
+
+    // Particulate Matter chart
+    "new Chart(document.getElementById('pmChart'),{type:'line',data:{"
+      "labels:labels,datasets:["
+        "{label:'PM1.0',data:p1,borderColor:'#2ecc71',borderWidth:1.5,pointRadius:0,tension:0.3},"
+        "{label:'PM2.5',data:p25,borderColor:'#e67e22',borderWidth:1.5,pointRadius:0,tension:0.3},"
+        "{label:'PM10',data:p10,borderColor:'#9b59b6',borderWidth:1.5,pointRadius:0,tension:0.3}"
+      "]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},"
+        "scales:{"
+          "x:{type:'time',time:{tooltipFormat:'MMM d, HH:mm',displayFormats:{hour:'HH:mm',day:'MMM d'}},"
+            "ticks:{maxTicksLimit:8}},"
+          "y:{position:'left',title:{display:true,text:'\\u03BCg/m\\u00B3'},beginAtZero:true}"
+        "}"
+      "}});\n"
+  );
+
+  // ---- CSV download button ----
+  // When the user clicks "Download CSV", JavaScript builds a CSV
+  // string from the same data arrays, creates a temporary download
+  // link, and clicks it. This all happens in the browser -- the
+  // ESP32 doesn't need to do any extra work.
+  //
+  // The CSV format is simple and opens in any spreadsheet app:
+  //   seconds_ago,temperature,humidity,pm1_0,pm2_5,pm10
+  client.print(
+    "function downloadCSV(){"
+      "var lines=['seconds_ago,temperature,humidity,pm1_0,pm2_5,pm10'];"
+      "for(var i=0;i<ts.length;i++){"
+        "lines.push(ts[i]+','+(tp[i]===null?'':tp[i])+','+"
+          "(hu[i]===null?'':hu[i])+','+p1[i]+','+p25[i]+','+p10[i]);"
+      "}"
+      "var blob=new Blob([lines.join('\\n')],{type:'text/csv'});"
+      "var a=document.createElement('a');"
+      "a.href=URL.createObjectURL(blob);"
+      "a.download='airquality.csv';"
+      "a.click();"
+    "}\n"
+    "</script>\n"
+  );
+
+  // ---- Download button and footer ----
+  sendChunk(client,
+    "<button class='btn' onclick='downloadCSV()'>Download CSV</button>"
+    "<p class='info'>%d data points stored (up to %d max = 7 days). "
+    "Page refreshes every 30 seconds.</p>"
+    "</body></html>",
+    historyCount, HISTORY_MAX);
+}
+
+/*
+ * sendCSVData() - Stream raw CSV data for programmatic download.
+ *
+ * This endpoint (GET /data.csv) returns the history buffer as a
+ * plain CSV file. Useful for importing into Excel, Google Sheets,
+ * Python scripts, etc. without going through the browser's
+ * JavaScript-based download.
+ *
+ * The response includes a Content-Disposition header that tells
+ * the browser to save the file as "airquality.csv" rather than
+ * displaying it.
+ */
+void sendCSVData(WiFiClient& client) {
+  client.println("HTTP/1.1 200 OK");
+  client.println("Content-Type: text/csv");
+  client.println("Content-Disposition: attachment; filename=\"airquality.csv\"");
+  client.println("Connection: close");
+  client.println();
+
+  // CSV header row
+  client.println("seconds_ago,temperature,humidity,pm1_0,pm2_5,pm10");
+
+  unsigned long nowSec = millis() / 1000;
+  int start = (historyCount < HISTORY_MAX) ? 0 : historyHead;
+
+  for (int i = 0; i < historyCount; i++) {
+    int idx = (start + i) % HISTORY_MAX;
+    DataPoint& dp = history[idx];
+    long ago = (long)(nowSec - dp.ts);
+
+    if (isnan(dp.temp)) {
+      sendChunk(client, "%ld,,,%.0f,%.0f,%.0f\n",
+        ago, dp.pm1_0, dp.pm2_5, dp.pm10);
+    } else {
+      sendChunk(client, "%ld,%.1f,%.1f,%.0f,%.0f,%.0f\n",
+        ago, dp.temp, dp.humidity, dp.pm1_0, dp.pm2_5, dp.pm10);
+    }
+  }
+}
 
 /*
  * handleClient() - Check if a browser is requesting our page, and respond.
@@ -322,8 +666,11 @@ const char* htmlPage() {
  * The ESP32 runs a very simple HTTP server. When someone types the ESP32's
  * IP address into their browser, the browser opens a TCP connection and
  * sends an HTTP request (like "GET / HTTP/1.1"). We read that request
- * (we don't actually parse it -- we serve the same page for everything),
- * build the HTML, and send it back with the proper HTTP headers.
+ * to determine which resource was requested:
+ *
+ *   GET /           -> Send the dashboard page with charts
+ *   GET /data.csv   -> Send raw CSV data for download
+ *   Anything else   -> Send the dashboard page (fallback)
  *
  * This function is non-blocking: if nobody is connecting right now, it
  * returns immediately so the main loop can keep reading sensors.
@@ -348,22 +695,17 @@ void handleClient() {
     return;
   }
 
-  // Read the first line of the HTTP request (e.g., "GET / HTTP/1.1").
-  // We don't use it, but we need to consume it so the client is ready
-  // to receive our response.
+  // Read the first line of the HTTP request (e.g., "GET /data.csv HTTP/1.1").
+  // We check if it contains "/data.csv" to decide which response to send.
   String req = client.readStringUntil('\r');
   client.flush();  // Discard the rest of the request headers
 
-  // Build the HTML page from cached sensor data and send it.
-  const char* page = htmlPage();
-
-  // Send standard HTTP response headers. "Connection: close" tells the
-  // browser we'll close the connection after sending (no keep-alive).
-  client.println("HTTP/1.1 200 OK");
-  client.println("Content-Type: text/html");
-  client.println("Connection: close");
-  client.println();       // Blank line separates headers from body
-  client.println(page);   // The actual HTML content
+  // Route the request to the appropriate handler.
+  if (req.indexOf("/data.csv") >= 0) {
+    sendCSVData(client);
+  } else {
+    sendDashboardPage(client);
+  }
 }
 
 // ============================================================
