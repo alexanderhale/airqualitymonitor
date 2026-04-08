@@ -122,7 +122,7 @@ RX   ---------> GPIO 17 (ESP32 TX2)
 ### 2. Clone or Download This Project
 
 ```bash
-git clone <this-repo-url>
+git clone https://github.com/alexanderhale/airqualitymonitor
 cd airqualitymonitor
 ```
 
