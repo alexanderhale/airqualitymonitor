@@ -45,6 +45,7 @@
 // secrets.h:         Your WiFi SSID and password (not committed to git)
 
 #include <WiFi.h>
+#include <time.h>
 #include <Adafruit_Sensor.h>
 #include <DHT.h>
 #include <DHT_U.h>
@@ -271,6 +272,24 @@ void setup() {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("WiFi connect failed, rebooting...");
     ESP.restart();
+  }
+
+  // Synchronize the ESP32's clock with an NTP (Network Time Protocol)
+  // server so we can produce real UTC timestamps in CSV exports.
+  // configTime() sets the timezone offset to 0 (UTC) and starts an
+  // async NTP request. We wait up to 10 seconds for the time to be set.
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  Serial.print("Waiting for NTP time sync...");
+  time_t now = 0;
+  unsigned long ntpStart = millis();
+  while (now < 1000000000L && millis() - ntpStart < 10000) {
+    delay(200);
+    time(&now);
+  }
+  if (now >= 1000000000L) {
+    Serial.println(" OK");
+  } else {
+    Serial.println(" FAILED (timestamps will be approximate)");
   }
 
   // Print the IP address so you know where to point your browser.
@@ -611,7 +630,7 @@ void sendDashboardPage(WiFiClient& client) {
           "borderWidth:1.5,pointRadius:0,tension:0.3,yAxisID:'y1',spanGaps:true}"
       "]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},"
         "scales:{"
-          "x:{type:'time',time:{tooltipFormat:'MMM d, HH:mm',displayFormats:{hour:'HH:mm',day:'MMM d'}},"
+          "x:{type:'time',time:{tooltipFormat:'MMM d, HH:mm',displayFormats:{hour:'MMM d, HH:mm',day:'MMM d'}},"
             "ticks:{maxTicksLimit:8}},"
           "y:{position:'left',title:{display:true,text:'\\u00B0C'}},"
           "y1:{position:'right',title:{display:true,text:'%'},grid:{drawOnChartArea:false}}"
@@ -626,7 +645,7 @@ void sendDashboardPage(WiFiClient& client) {
         "{label:'PM10',data:p10,borderColor:'#9b59b6',borderWidth:1.5,pointRadius:0,tension:0.3}"
       "]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},"
         "scales:{"
-          "x:{type:'time',time:{tooltipFormat:'MMM d, HH:mm',displayFormats:{hour:'HH:mm',day:'MMM d'}},"
+          "x:{type:'time',time:{tooltipFormat:'MMM d, HH:mm',displayFormats:{hour:'MMM d, HH:mm',day:'MMM d'}},"
             "ticks:{maxTicksLimit:8}},"
           "y:{position:'left',title:{display:true,text:'\\u03BCg/m\\u00B3'},beginAtZero:true}"
         "}"
@@ -640,12 +659,12 @@ void sendDashboardPage(WiFiClient& client) {
   // ESP32 doesn't need to do any extra work.
   //
   // The CSV format is simple and opens in any spreadsheet app:
-  //   seconds_ago,temperature,humidity,pm1_0,pm2_5,pm10
+  //   timestamp_utc,temperature,humidity,pm1_0,pm2_5,pm10
   client.print(
     "function downloadCSV(){"
-      "var lines=['seconds_ago,temperature,humidity,pm1_0,pm2_5,pm10'];"
+      "var lines=['timestamp_utc,temperature,humidity,pm1_0,pm2_5,pm10'];"
       "for(var i=0;i<ts.length;i++){"
-        "lines.push(ts[i]+','+(tp[i]===null?'':tp[i])+','+"
+        "lines.push(labels[i].toISOString()+','+(tp[i]===null?'':tp[i])+','+"
           "(hu[i]===null?'':hu[i])+','+p1[i]+','+p25[i]+','+p10[i]);"
       "}"
       "var blob=new Blob([lines.join('\\n')],{type:'text/csv'});"
@@ -676,7 +695,8 @@ void sendDashboardPage(WiFiClient& client) {
  *
  * The response includes a Content-Disposition header that tells
  * the browser to save the file as "airquality.csv" rather than
- * displaying it.
+ * displaying it. Timestamps are ISO 8601 UTC (e.g., "2025-01-15T14:30:00Z"),
+ * computed from NTP-synced wall-clock time minus uptime offset.
  */
 void sendCSVData(WiFiClient& client) {
   client.println("HTTP/1.1 200 OK");
@@ -686,22 +706,37 @@ void sendCSVData(WiFiClient& client) {
   client.println();
 
   // CSV header row
-  client.println("seconds_ago,temperature,humidity,pm1_0,pm2_5,pm10");
+  client.println("timestamp_utc,temperature,humidity,pm1_0,pm2_5,pm10");
 
+  // Get the current wall-clock time and uptime so we can convert each
+  // data point's boot-relative timestamp to a real UTC time.
+  time_t nowWall;
+  time(&nowWall);
   unsigned long nowSec = millis() / 1000;
+
   int start = (historyCount < historyMax) ? 0 : historyHead;
 
   for (int i = 0; i < historyCount; i++) {
     int idx = (start + i) % historyMax;
     DataPoint& dp = history[idx];
-    long ago = (long)(nowSec - dp.ts);
+
+    // Convert boot-relative seconds to wall-clock UTC.
+    // dp.ts is seconds since boot; nowSec is current seconds since boot.
+    // The difference gives us how long ago this reading was taken.
+    time_t pointTime = nowWall - (time_t)(nowSec - dp.ts);
+    struct tm tmBuf;
+    gmtime_r(&pointTime, &tmBuf);
+
+    // Format as ISO 8601 UTC: "2025-01-15T14:30:00Z"
+    char isoTime[21];
+    strftime(isoTime, sizeof(isoTime), "%Y-%m-%dT%H:%M:%SZ", &tmBuf);
 
     if (isnan(dp.temp)) {
-      sendChunk(client, "%ld,,,%.0f,%.0f,%.0f\n",
-        ago, dp.pm1_0, dp.pm2_5, dp.pm10);
+      sendChunk(client, "%s,,,%.0f,%.0f,%.0f\n",
+        isoTime, dp.pm1_0, dp.pm2_5, dp.pm10);
     } else {
-      sendChunk(client, "%ld,%.1f,%.1f,%.0f,%.0f,%.0f\n",
-        ago, dp.temp, dp.humidity, dp.pm1_0, dp.pm2_5, dp.pm10);
+      sendChunk(client, "%s,%.1f,%.1f,%.0f,%.0f,%.0f\n",
+        isoTime, dp.temp, dp.humidity, dp.pm1_0, dp.pm2_5, dp.pm10);
     }
   }
 }
